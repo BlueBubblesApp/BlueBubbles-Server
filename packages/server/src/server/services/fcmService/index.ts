@@ -10,6 +10,7 @@ import { Loggable } from "@server/lib/logging/Loggable";
 import { AsyncSingleton } from "@server/lib/decorators/AsyncSingletonDecorator";
 import { AsyncRetryer } from "@server/lib/decorators/AsyncRetryerDecorator";
 import { ProxyServices } from "@server/databases/server/constants";
+import { boundFcmDataPayload, FCM_MAX_DATA_BYTES } from "./FcmPayload";
 
 const AppName = "BlueBubbles";
 
@@ -451,9 +452,19 @@ export class FCMService extends Loggable {
         try {
             if (!this.hasInitialized && !(await this.start())) return null;
 
-            // Build out the notification message
+            const boundedData = boundFcmDataPayload(data);
+            if (!boundedData) {
+                this.log.warn(
+                    "Skipping FCM notification because its data envelope is invalid or cannot fit within " +
+                        `${FCM_MAX_DATA_BYTES} bytes.`
+                );
+                return { responses: [], successCount: 0, failureCount: 0 };
+            }
+
+            // Build out the notification message. The Admin SDK expands this
+            // multicast payload into one message per token without changing data.
             const payload: admin.messaging.MulticastMessage = {
-                data,
+                data: boundedData,
                 tokens: devices,
                 android: {
                     priority,
@@ -471,9 +482,8 @@ export class FCMService extends Loggable {
                         const code = resp.error?.code;
                         const msg = resp.error?.message;
                         if (code === "messaging/payload-size-limit-exceeded") {
-                            // Manually handle the size limit error
+                            // Do not log payload contents: they may contain message/chat identifiers or credentials.
                             this.log.warn("Could not send Firebase Notification due to payload exceeding size limits!");
-                            this.log.debug(`Failed notification Payload: ${JSON.stringify(data)}`);
                         } else if (code !== "messaging/registration-token-not-registered") {
                             // Ignore token not registered errors
                             this.log.error(`Firebase returned the following error (Code: ${code}): ${msg}`);
