@@ -24,6 +24,7 @@ const MINIMAL_MESSAGE_FIELDS = [
     "guid",
     "tempGuid",
     "text",
+    "subject",
     "dateCreated",
     "dateRead",
     "dateDelivered",
@@ -83,16 +84,53 @@ function fits(payload: FcmDataPayload): boolean {
     return fcmDataPayloadBytes(payload) <= FCM_MAX_DATA_BYTES;
 }
 
-function isMessagePayload(data: unknown): data is Record<string, any> {
-    return isRecord(data) && typeof data.guid === "string" && data.guid.length > 0;
+function hasOwn(source: Record<string, any>, field: string): boolean {
+    return Object.prototype.hasOwnProperty.call(source, field);
+}
+
+function isNullableString(value: unknown): boolean {
+    return value === null || typeof value === "string";
+}
+
+function isNullableFiniteNumber(value: unknown): boolean {
+    return value === null || Number.isFinite(value);
+}
+
+function isRoutingChat(value: unknown): value is Record<string, any> {
+    return (
+        isRecord(value) &&
+        typeof value.guid === "string" &&
+        value.guid.length > 0 &&
+        hasOwn(value, "displayName") &&
+        isNullableString(value.displayName)
+    );
 }
 
 function hasRoutingChats(message: Record<string, any>): boolean {
-    return (
-        Array.isArray(message.chats) &&
-        message.chats.length > 0 &&
-        message.chats.every(chat => isRecord(chat) && typeof chat.guid === "string" && chat.guid.length > 0)
-    );
+    return Array.isArray(message.chats) && message.chats.length > 0 && message.chats.every(isRoutingChat);
+}
+
+function isMessagePayload(data: unknown, requiresRoutingChats: boolean): data is Record<string, any> {
+    if (!isRecord(data)) return false;
+
+    const hasCoreContract =
+        typeof data.guid === "string" &&
+        data.guid.length > 0 &&
+        hasOwn(data, "text") &&
+        isNullableString(data.text) &&
+        hasOwn(data, "subject") &&
+        isNullableString(data.subject) &&
+        // MessageSerializer emits null when Messages has no creation date.
+        hasOwn(data, "dateCreated") &&
+        isNullableFiniteNumber(data.dateCreated) &&
+        typeof data.isFromMe === "boolean" &&
+        Number.isFinite(data.itemType) &&
+        Array.isArray(data.attachments) &&
+        data.attachments.every(isRecord);
+    if (!hasCoreContract) return false;
+
+    if (requiresRoutingChats) return hasRoutingChats(data);
+    return !hasOwn(data, "chats") || (Array.isArray(data.chats) && data.chats.every(isRoutingChat));
 }
 
 function clearParticipants(message: Record<string, any>): void {
@@ -125,7 +163,7 @@ function pick(source: Record<string, any>, fields: string[]): Record<string, any
 }
 
 function minimalChat(chat: Record<string, any>): Record<string, any> {
-    return pick(chat, ["originalROWID", "guid", "style", "chatIdentifier", "isArchived"]);
+    return pick(chat, ["originalROWID", "guid", "style", "chatIdentifier", "isArchived", "displayName"]);
 }
 
 function minimalHandle(handle: unknown): unknown {
@@ -143,6 +181,8 @@ function minimalAttachment(attachment: unknown): unknown {
               "uti",
               "transferName",
               "totalBytes",
+              "height",
+              "width",
               "isSticker",
               "hideAttachment",
               "originalGuid",
@@ -176,12 +216,12 @@ export function boundFcmDataPayload(value: unknown): FcmDataPayload | null {
         return null;
     }
 
-    if (MESSAGE_EVENT_TYPES.has(value.type) && !isMessagePayload(decoded)) return null;
+    const isKnownMessageEvent = MESSAGE_EVENT_TYPES.has(value.type);
+    if (isKnownMessageEvent && !isMessagePayload(decoded, value.type !== "updated-message")) return null;
     if (fits(value)) return { ...value };
 
     // Only known message events have a client-compatible compaction contract.
-    if (!MESSAGE_EVENT_TYPES.has(value.type) || !isMessagePayload(decoded)) return null;
-    if (value.type !== "updated-message" && !hasRoutingChats(decoded)) return null;
+    if (!isKnownMessageEvent) return null;
 
     // JSON.parse above gives us an isolated copy, so socket/webhook source data
     // and the caller's final envelope cannot be mutated by FCM compaction.
