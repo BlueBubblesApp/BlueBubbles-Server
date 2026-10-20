@@ -81,7 +81,10 @@ test("rejects small known message events missing their minimum client contract",
         envelope("new-message", message({ dateCreated: undefined })),
         envelope("new-message", message({ isFromMe: undefined })),
         envelope("new-message", message({ itemType: undefined })),
-        envelope("new-message", message({ attachments: undefined }))
+        envelope("new-message", message({ attachments: undefined })),
+        envelope("new-message", message({ chats: [{ guid: "chat-guid" }] })),
+        envelope("new-message", message({ chats: [{ displayName: "Group name" }] })),
+        envelope("updated-message", message({ chats: [{ guid: "chat-guid" }] }))
     ];
 
     for (const payload of invalid) assert.equal(boundFcmDataPayload(payload), null);
