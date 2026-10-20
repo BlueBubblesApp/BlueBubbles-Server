@@ -4,6 +4,7 @@ import test from "node:test";
 import {
     boundFcmDataPayload,
     FCM_MAX_DATA_BYTES,
+    fcmDataKeyValueBytes,
     fcmDataPayloadBytes,
     type FcmDataPayload
 } from "../src/server/services/fcmService/FcmPayload";
@@ -78,6 +79,7 @@ test("rejects small known message events missing their minimum client contract",
         envelope("new-message", { guid: "m", text: "body", chats: [] }),
         envelope("updated-message", { guid: "m" }),
         envelope("new-message", message({ subject: undefined })),
+        envelope("new-message", message({ text: undefined })),
         envelope("new-message", message({ dateCreated: undefined })),
         envelope("new-message", message({ isFromMe: undefined })),
         envelope("new-message", message({ itemType: undefined })),
@@ -222,6 +224,54 @@ test("fails safe when complete text or subject semantics cannot fit", () => {
     ];
 
     for (const payload of cases) assert.equal(boundFcmDataPayload(payload), null);
+});
+
+test("sends the minimal form when only JSON re-escaping exceeds the conservative bound", () => {
+    // Each newline is two bytes in Firebase's key+value accounting but three
+    // bytes once the envelope itself is JSON-encoded.
+    const source = message({ text: "\n".repeat(1400), tempGuid: "temp-guid" });
+    const payload = envelope("new-message", source);
+
+    assert.ok(fcmDataPayloadBytes(payload) > FCM_MAX_DATA_BYTES);
+    assert.ok(fcmDataKeyValueBytes(payload) <= FCM_MAX_DATA_BYTES);
+    const bounded = boundFcmDataPayload(payload);
+
+    assert.ok(bounded);
+    assert.ok(fcmDataKeyValueBytes(bounded!) <= FCM_MAX_DATA_BYTES);
+    const result = decode(bounded!);
+    assert.equal(result.text, source.text);
+    assert.equal(result.tempGuid, source.tempGuid);
+});
+
+test("passes unknown events that fit Firebase's key+value accounting", () => {
+    const payload = envelope("event", { note: "\n".repeat(1400) });
+
+    assert.ok(fcmDataPayloadBytes(payload) > FCM_MAX_DATA_BYTES);
+    assert.deepEqual(boundFcmDataPayload(payload), payload);
+});
+
+test("minimal fallback keeps every field the client reads before fetching more", () => {
+    const source = message({
+        tempGuid: "temp-guid",
+        isFromMe: true,
+        itemType: 0,
+        dateCreated: 987654321,
+        attachments: [
+            { guid: "attachment-guid", mimeType: "image/png", transferName: "a.png", height: 1, width: 2 }
+        ],
+        unknownOptionalField: "u".repeat(5000)
+    });
+
+    const result = decode(boundFcmDataPayload(envelope("new-message", source))!);
+
+    assert.equal(result.unknownOptionalField, undefined);
+    for (const field of ["guid", "tempGuid", "text", "subject", "dateCreated", "isFromMe", "itemType"]) {
+        assert.deepEqual(result[field], source[field], field);
+    }
+    assert.deepEqual(result.attachments, source.attachments);
+    for (const field of ["guid", "style", "chatIdentifier", "displayName"]) {
+        assert.equal(result.chats[0][field], source.chats[0][field], field);
+    }
 });
 
 test("preserves valid small unknown event shapes", () => {

@@ -59,6 +59,14 @@ export function fcmDataPayloadBytes(payload: FcmDataPayload): number {
     return Buffer.byteLength(JSON.stringify(payload), "utf8");
 }
 
+/** Firebase's documented accounting: UTF-8 bytes of every data key and value. */
+export function fcmDataKeyValueBytes(payload: FcmDataPayload): number {
+    return Object.entries(payload).reduce(
+        (total, [key, value]) => total + Buffer.byteLength(key, "utf8") + Buffer.byteLength(value, "utf8"),
+        0
+    );
+}
+
 function isRecord(value: unknown): value is Record<string, any> {
     return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -82,6 +90,10 @@ function encode(type: string, data: unknown): FcmDataPayload {
 
 function fits(payload: FcmDataPayload): boolean {
     return fcmDataPayloadBytes(payload) <= FCM_MAX_DATA_BYTES;
+}
+
+function fitsFirebaseLimit(payload: FcmDataPayload): boolean {
+    return fcmDataKeyValueBytes(payload) <= FCM_MAX_DATA_BYTES;
 }
 
 function hasOwn(source: Record<string, any>, field: string): boolean {
@@ -202,8 +214,10 @@ function minimalMessage(message: Record<string, any>): Record<string, any> {
 /**
  * Bounds the exact `{type,data}` string map passed to Firebase Admin's `data`
  * field. Firebase documents the 4096-byte limit as covering data keys and
- * values; measuring the JSON form is conservative because it also counts JSON
- * framing and escaping. Unknown oversized event shapes are skipped rather than
+ * values. Compaction stages target the stricter JSON form, which also counts
+ * framing and re-escaping, so ordinary payloads keep headroom; a payload is
+ * only skipped when even its smallest valid form exceeds Firebase's own
+ * accounting. Unknown oversized event shapes are skipped rather than
  * corrupted. Canonical message text is never truncated.
  */
 export function boundFcmDataPayload(value: unknown): FcmDataPayload | null {
@@ -221,7 +235,7 @@ export function boundFcmDataPayload(value: unknown): FcmDataPayload | null {
     if (fits(value)) return { ...value };
 
     // Only known message events have a client-compatible compaction contract.
-    if (!isKnownMessageEvent) return null;
+    if (!isKnownMessageEvent) return fitsFirebaseLimit(value) ? { ...value } : null;
 
     // JSON.parse above gives us an isolated copy, so socket/webhook source data
     // and the caller's final envelope cannot be mutated by FCM compaction.
@@ -238,5 +252,5 @@ export function boundFcmDataPayload(value: unknown): FcmDataPayload | null {
     if (fits(candidate)) return candidate;
 
     candidate = encode(value.type, minimalMessage(decoded));
-    return fits(candidate) ? candidate : null;
+    return fitsFirebaseLimit(candidate) ? candidate : null;
 }
