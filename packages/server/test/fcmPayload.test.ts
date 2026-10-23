@@ -215,6 +215,19 @@ test("minimal fallback preserves canonical subject and group displayName", () =>
     assert.ok(fcmDataPayloadBytes(bounded!) <= FCM_MAX_DATA_BYTES);
 });
 
+test("minimal fallback keeps the chat's spam flag only when the source has one", () => {
+    const oversized = { unknownOptionalField: "u".repeat(5000) };
+    const spam = message({ ...oversized, chats: [{ ...message().chats[0], isFilteredAsSpam: true }] });
+    const legacy = message(oversized);
+
+    const spamResult = decode(boundFcmDataPayload(envelope("new-message", spam))!);
+    const legacyResult = decode(boundFcmDataPayload(envelope("new-message", legacy))!);
+
+    assert.equal(spamResult.unknownOptionalField, undefined);
+    assert.equal(spamResult.chats[0].isFilteredAsSpam, true);
+    assert.equal(Object.prototype.hasOwnProperty.call(legacyResult.chats[0], "isFilteredAsSpam"), false);
+});
+
 test("fails safe when complete text or subject semantics cannot fit", () => {
     const cases = [
         envelope("new-message", message({ text: "🙂".repeat(2000) })),

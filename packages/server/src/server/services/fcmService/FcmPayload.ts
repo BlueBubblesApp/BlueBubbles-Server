@@ -175,7 +175,15 @@ function pick(source: Record<string, any>, fields: string[]): Record<string, any
 }
 
 function minimalChat(chat: Record<string, any>): Record<string, any> {
-    return pick(chat, ["originalROWID", "guid", "style", "chatIdentifier", "isArchived", "displayName"]);
+    return pick(chat, [
+        "originalROWID",
+        "guid",
+        "style",
+        "chatIdentifier",
+        "isArchived",
+        "displayName",
+        "isFilteredAsSpam"
+    ]);
 }
 
 function minimalHandle(handle: unknown): unknown {
