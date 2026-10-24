@@ -3,6 +3,7 @@ import { DEFAULT_CHAT_CONFIG, DEFAULT_HANDLE_CONFIG, DEFAULT_MESSAGE_CONFIG } fr
 import type { ChatSerializerMutliParams, ChatSerializerSingleParams } from "./types";
 import { MessageSerializer } from "./MessageSerializer";
 import { HandleSerializer } from "./HandleSerializer";
+import { isChatFilteredAsSpam } from "./chatSpam";
 
 export class ChatSerializer {
     static async serialize({
@@ -57,7 +58,10 @@ export class ChatSerializer {
             style: chat.style,
             chatIdentifier: chat.chatIdentifier,
             isArchived: chat.isArchived,
-            displayName: chat.displayName
+            displayName: chat.displayName,
+            // Included in notifications too: the first message from a new spam
+            // sender arrives by push, before any chat sync.
+            isFilteredAsSpam: isChatFilteredAsSpam(chat.properties)
         };
 
         if (config.includeParticipants) {

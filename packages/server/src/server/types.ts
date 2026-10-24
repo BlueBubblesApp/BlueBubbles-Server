@@ -98,6 +98,7 @@ export type ChatResponse = {
     chatIdentifier: string;
     isArchived: boolean;
     isFiltered?: boolean;
+    isFilteredAsSpam?: boolean;
     displayName: string;
     groupId?: string;
     lastAddressedHandle?: string | null;
