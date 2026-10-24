@@ -38,7 +38,15 @@ import { runTerminalScript, openSystemPreferences, startMessages } from "@server
 
 import { ActionHandler } from "./api/apple/actions";
 import { insertChatParticipants, isEmpty, isNotEmpty, waitMs } from "./helpers/utils";
-import { isMinBigSur, isMinCatalina, isMinHighSierra, isMinMojave, isMinMonterey, isMinSierra } from "./env";
+import {
+    isMinBigSur,
+    isMinCatalina,
+    isMinHighSierra,
+    isMinMojave,
+    isMinMonterey,
+    isMinSierra,
+    isMinVentura
+} from "./env";
 import { Proxy } from "./services/proxyServices/proxy";
 import { PrivateApiService } from "./api/privateApi/PrivateApiService";
 import { OutgoingMessageManager } from "./managers/outgoingMessageManager";
@@ -47,6 +55,9 @@ import { AlertsInterface } from "./api/interfaces/alertsInterface";
 import { MessageSerializer } from "./api/serializers/MessageSerializer";
 import {
     CHAT_READ_STATUS_CHANGED,
+    CHAT_DELETED,
+    MESSAGE_DELETED,
+    MESSAGE_RESTORED,
     GROUP_ICON_CHANGED,
     GROUP_ICON_REMOVED,
     GROUP_NAME_CHANGE,
@@ -65,9 +76,20 @@ import { FindMyFriendsCache } from "./api/lib/findmy/FindMyFriendsCache";
 import { ScheduledService } from "./lib/ScheduledService";
 import { getLogger } from "./lib/logging/Loggable";
 import { IMessageListener } from "./databases/imessage/listeners/IMessageListener";
-import { ChatUpdatePoller } from "./databases/imessage/pollers/ChatChangePoller";
 import { IMessageCache } from "./databases/imessage/pollers";
 import { MessagePoller } from "./databases/imessage/pollers/MessagePoller";
+import { ChatUpdatePoller } from "./databases/imessage/pollers/ChatChangePoller";
+import {
+    loadChatStateSnapshot,
+    supportsChatStateSnapshot,
+    type ChatStateSnapshotResult
+} from "./databases/imessage/snapshot/ChatStateSnapshot";
+import { RecoverableMessagePoller } from "./databases/imessage/pollers/RecoverableMessagePoller";
+import {
+    loadRecoverableMessageSnapshot,
+    supportsRecoverableMessages,
+    type RecoverableMessageSnapshotResult
+} from "./databases/imessage/snapshot/RecoverableMessageSnapshot";
 import { obfuscatedHandle } from "./utils/StringUtils";
 import { AutoStartMethods } from "./databases/server/constants";
 import { MacOsInterface } from "./api/interfaces/macosInterface";
@@ -1153,6 +1175,62 @@ class BlueBubblesServer extends EventEmitter {
     }
 
     /**
+     * Serves the complete Apple-side chat list with each chat's current read
+     * state, for a client to reconcile against.
+     *
+     * The live read events and the delete APIs cover changes that happen while a
+     * client is connected. Nothing covers a client that was offline, so the
+     * device silently keeps chats Apple no longer has and read states it never
+     * received. This is the recovery half of that: a full statement of what
+     * exists now, rather than a replay of what changed.
+     *
+     * `complete` is what licenses the client to delete. It is only true when the
+     * entire query succeeded, so a failure, timeout or unavailable database
+     * cannot be read as "Apple has no chats" and wipe the device.
+     */
+    async getChatStateSnapshot(): Promise<ChatStateSnapshotResult> {
+        if (!this.iMessageRepo?.db) {
+            throw new Error("iMessage repository is not initialized");
+        }
+
+        const snapshot = await loadChatStateSnapshot(this.iMessageRepo.db);
+        const unread = snapshot.chats.filter(chat => !chat.read).length;
+        this.logger.info(
+            `Served chat state snapshot: ${snapshot.chats.length} chats ` +
+                `(${snapshot.chats.length - unread} read, ${unread} unread)`
+        );
+
+        return snapshot;
+    }
+
+    /**
+     * Serves every message Apple currently holds in Recently Deleted,
+     * grouped by chat, for a client to reconcile against.
+     *
+     * The live events cover deletions and restorations that happen while a
+     * client is connected. Nothing covers a client that was offline, so the
+     * device keeps showing messages Apple has since deleted. This is the
+     * recovery half: a statement of what is deleted now, not a replay.
+     *
+     * `complete` is what licenses the client to un-hide anything. It is only
+     * true when the whole query succeeded, so a failure cannot be read as
+     * "nothing is deleted" and restore messages the user deleted on Apple.
+     */
+    async getRecoverableMessageSnapshot(): Promise<RecoverableMessageSnapshotResult> {
+        if (!this.iMessageRepo?.db) {
+            throw new Error("iMessage repository is not initialized");
+        }
+
+        const snapshot = await loadRecoverableMessageSnapshot(this.iMessageRepo.db);
+        const total = snapshot.chats.reduce((sum, chat) => sum + chat.deletedMessageGuids.length, 0);
+        this.logger.info(
+            `Served recoverable message snapshot: ${total} deleted messages across ${snapshot.chats.length} chats`
+        );
+
+        return snapshot;
+    }
+
+    /**
      * Emits a notification to to your connected devices over FCM and socket
      *
      * @param type The type of notification
@@ -1304,15 +1382,56 @@ class BlueBubblesServer extends EventEmitter {
 
         this.iMessageListener.addPoller(new MessagePoller(this.iMessageRepo, cache));
 
-        if (isMinHighSierra) {
+        // Reads are detected by a dedicated poller. The message poller's query
+        // is capped at 100 rows ordered by date created, so a message read now
+        // but created earlier never appears in its result set. Preserve the
+        // existing OS gate because the snapshot query uses chat columns that
+        // are unavailable on earlier macOS versions.
+        if (supportsChatStateSnapshot(isMinHighSierra)) {
             this.iMessageListener.addPoller(new ChatUpdatePoller(this.iMessageRepo, cache));
         }
 
-        this.iMessageListener.on(CHAT_READ_STATUS_CHANGED, async (item: Chat) => {
-            this.logger.info(`Chat read [${item.guid}]`);
+        this.iMessageListener.on(CHAT_READ_STATUS_CHANGED, async (item: { guid: string; read: boolean }) => {
+            // Preserve the detector's transition decision verbatim. On Monterey,
+            // Mark as Unread moves the chat-level read pointer backward while the
+            // message rows remain read; re-querying those rows would erase the
+            // unread transition and incorrectly emit read: true.
+            this.logger.info(`Chat read state changed [${item.guid}]: ${item.read ? "read" : "unread"}`);
             await Server().emitMessage(CHAT_READ_STATUS_CHANGED, {
                 chatGuid: item.guid,
-                read: true
+                read: item.read
+            });
+        });
+
+        // Recently Deleted only exists on Ventura and later. Deleting a single
+        // message leaves both the chat row and the message row in place, so no
+        // other poller can observe it.
+        if (supportsRecoverableMessages(isMinVentura)) {
+            this.iMessageListener.addPoller(new RecoverableMessagePoller(this.iMessageRepo, cache));
+        }
+
+        this.iMessageListener.on(MESSAGE_DELETED, async (item: { chatGuid: string; messageGuid: string }) => {
+            // The poller seeds silently on its first run and only reports
+            // transitions, so this mirrors an Apple-side delete without
+            // re-checking the database. Only the two GUIDs are sent: the client
+            // already holds the message, and this also goes out over FCM.
+            this.logger.info(`Message deleted on Apple [${item.messageGuid}]`);
+            await Server().emitMessage(MESSAGE_DELETED, item);
+        });
+
+        this.iMessageListener.on(MESSAGE_RESTORED, async (item: { chatGuid: string; messageGuid: string }) => {
+            this.logger.info(`Message restored on Apple [${item.messageGuid}]`);
+            await Server().emitMessage(MESSAGE_RESTORED, item);
+        });
+
+        this.iMessageListener.on(CHAT_DELETED, async (item: { guid: string }) => {
+            // A chat Apple previously held with messages is now empty or absent.
+            // The detector already enforces forward-only semantics (it only fires
+            // for chats previously observed non-empty), so this can be trusted to
+            // mirror Apple's deletion without re-checking the database.
+            this.logger.info(`Chat deleted on Apple [${item.guid}]`);
+            await Server().emitMessage(CHAT_DELETED, {
+                chatGuid: item.guid
             });
         });
 

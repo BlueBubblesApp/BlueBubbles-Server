@@ -7,13 +7,55 @@ import { GeneralInterface } from "@server/api/interfaces/generalInterface";
 import { Success } from "../responses/success";
 import { AlertsInterface } from "@server/api/interfaces/alertsInterface";
 import { isEmpty, isTruthyBool } from "@server/helpers/utils";
-import { BadRequest } from "../responses/errors";
+import { BadRequest, ServerError } from "../responses/errors";
+import { isMinHighSierra } from "@server/env";
+import { supportsChatStateSnapshot } from "@server/databases/imessage/snapshot/ChatStateSnapshot";
+import { isMinVentura } from "@server/env";
+import { supportsRecoverableMessages } from "@server/databases/imessage/snapshot/RecoverableMessageSnapshot";
 import { autoUpdater } from "electron-updater";
 import { SERVER_UPDATE_DOWNLOADING } from "@server/events";
 
 export class ServerRouter {
     static async getInfo(ctx: RouterContext, _: Next) {
         return new Success(ctx, { data: await GeneralInterface.getServerMetadata() }).send();
+    }
+
+    static async getChatStateSnapshot(ctx: RouterContext, _: Next) {
+        if (!supportsChatStateSnapshot(isMinHighSierra)) {
+            throw new BadRequest({
+                message: "Chat-state snapshots require macOS High Sierra or later!",
+                error: "UNSUPPORTED_MACOS_VERSION"
+            });
+        }
+
+        try {
+            const result = await Server().getChatStateSnapshot();
+            return new Success(ctx, { data: result }).send();
+        } catch (ex: any) {
+            throw new ServerError({
+                message: "Failed to build chat state snapshot!",
+                error: ex?.message ?? ex.toString()
+            });
+        }
+    }
+
+    static async getRecoverableMessageSnapshot(ctx: RouterContext, _: Next) {
+        if (!supportsRecoverableMessages(isMinVentura)) {
+            throw new BadRequest({
+                message: "Recently Deleted requires macOS Ventura or later!",
+                error: "UNSUPPORTED_MACOS_VERSION"
+            });
+        }
+
+        try {
+            const result = await Server().getRecoverableMessageSnapshot();
+            return new Success(ctx, { data: result }).send();
+        } catch (ex: any) {
+            throw new ServerError({
+                message: "Failed to build recoverable message snapshot!",
+                error: ex?.message ?? ex.toString()
+            });
+        }
     }
 
     static async checkForUpdate(ctx: RouterContext, _: Next) {
@@ -39,7 +81,7 @@ export class ServerRouter {
             await waiter;
         }
 
-        return new Success(ctx, { message: 'Update has started downloading!' }).send();
+        return new Success(ctx, { message: "Update has started downloading!" }).send();
     }
 
     static async restartServices(ctx: RouterContext, _: Next) {
@@ -112,7 +154,7 @@ export class ServerRouter {
 
     static async markAsRead(ctx: RouterContext, _: Next) {
         const { ids } = ctx?.request?.body ?? {};
-        if (isEmpty(ids)) throw new BadRequest({ message: 'No alert IDs provided!' });
+        if (isEmpty(ids)) throw new BadRequest({ message: "No alert IDs provided!" });
         return new Success(ctx, { data: await AlertsInterface.markAsRead(ids) }).send();
     }
 }
